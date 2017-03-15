@@ -130,7 +130,6 @@ static ngx_int_t ngx_http_dyups_get_shm_name(ngx_str_t *shm_name,
 static ngx_int_t ngx_http_dyups_init_process(ngx_cycle_t *cycle);
 static void ngx_http_dyups_exit_process(ngx_cycle_t *cycle);
 static void ngx_http_dyups_read_msg(ngx_event_t *ev);
-static void ngx_http_dyups_read_msg_locked(ngx_event_t *ev);
 static void ngx_http_dyups_read_msg_not_locked(ngx_event_t *ev);
 static ngx_int_t ngx_http_dyups_send_msg(ngx_str_t *name, ngx_buf_t *body,
     ngx_uint_t flag);
@@ -748,23 +747,19 @@ ngx_dyups_delete_upstream(ngx_str_t *name, ngx_str_t *rv)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    if (!dmcf->trylock) {
-
-        ngx_shmtx_lock(&shpool->mutex);
-
-    } else {
-
-        if (!ngx_shmtx_trylock(&shpool->mutex)) {
-            return NGX_HTTP_CONFLICT;
-        }
-
-    }
-
-    ngx_http_dyups_read_msg_locked(timer);
+    ngx_http_dyups_read_msg_not_locked(timer);
 
     status = ngx_dyups_do_delete(name, rv);
     if (status != NGX_HTTP_OK) {
-        goto finish;
+        return status;
+    }
+
+    if (!dmcf->trylock) {
+        ngx_shmtx_lock(&shpool->mutex);
+    } else {
+        if (!ngx_shmtx_trylock(&shpool->mutex)) {
+            return NGX_HTTP_CONFLICT;
+        }
     }
 
     rc = ngx_http_dyups_send_msg(name, NULL, NGX_DYUPS_DELETE);
@@ -773,8 +768,6 @@ ngx_dyups_delete_upstream(ngx_str_t *name, ngx_str_t *rv)
         ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0, "[dyups] %V", &rv);
         status = NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-
- finish:
 
     ngx_shmtx_unlock(&shpool->mutex);
 
@@ -1990,121 +1983,6 @@ ngx_http_dyups_read_msg(ngx_event_t *ev)
     ngx_http_dyups_read_msg_not_locked(ev);
 
     ngx_dyups_add_timer(ev, dmcf->read_msg_timeout);
-}
-
-
-static void
-ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
-{
-    ngx_int_t            i, rc;
-    ngx_str_t            name, content;
-    ngx_flag_t           found;
-    ngx_time_t          *tp;
-    ngx_pool_t          *pool;
-    ngx_msec_t           now;
-    ngx_queue_t         *q, *t;
-    ngx_core_conf_t     *ccf;
-    ngx_slab_pool_t     *shpool;
-    ngx_dyups_msg_t     *msg;
-    ngx_dyups_shctx_t   *sh;
-    ngx_dyups_status_t  *status;
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                   "[dyups] read msg %P", ngx_pid);
-
-    ccf = (ngx_core_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
-                                           ngx_core_module);
-
-    sh = ngx_dyups_global_ctx.sh;
-    shpool = ngx_dyups_global_ctx.shpool;
-
-    tp = ngx_timeofday();
-    now = (ngx_msec_t) (tp->sec * 1000 + tp->msec);
-
-    for (i = 0; i < ccf->worker_processes; i++) {
-        status = &sh->status[i];
-
-        if (status->pid == 0 || status->pid == ngx_pid) {
-
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                           "[dyups] process %P update time %ui",
-                           status->pid, status->time);
-
-            status->pid = ngx_pid;
-            status->time = now;
-            break;
-        }
-    }
-
-    if (ngx_queue_empty(&sh->msg_queue)) {
-        return;
-    }
-
-    pool = ngx_create_pool(ngx_pagesize, ev->log);
-    if (pool == NULL) {
-        return;
-    }
-
-    for (q = ngx_queue_last(&sh->msg_queue);
-         q != ngx_queue_sentinel(&sh->msg_queue);
-         q = ngx_queue_prev(q))
-    {
-        msg = ngx_queue_data(q, ngx_dyups_msg_t, queue);
-
-        if (msg->count == ccf->worker_processes) {
-            t = ngx_queue_next(q); ngx_queue_remove(q); q = t;
-
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                                  "[dyups] destroy msg %V:%V",
-                                  &msg->name, &msg->content);
-
-            ngx_dyups_destroy_msg(shpool, msg);
-            continue;
-        }
-
-        found = 0;
-        for (i = 0; i < msg->count; i++) {
-
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                           "[dyups] msg pids [%P]", msg->pid[i]);
-
-            if (msg->pid[i] == ngx_pid) {
-                found = 1;
-                break;
-            }
-        }
-
-        if (found) {
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                           "[dyups] msg %V count %ui found",
-                           &msg->name, msg->count);
-            continue;
-        }
-
-        msg->pid[i] = ngx_pid;
-        msg->count++;
-
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                       "[dyups] msg %V count %ui", &msg->name, msg->count);
-
-        name = msg->name;
-        content = msg->content;
-
-        rc = ngx_dyups_sync_cmd(pool, &name, &content, msg->flag);
-        if (rc != NGX_OK) {
-            ngx_log_error(NGX_LOG_ALERT, ev->log, 0,
-                          "[dyups] read msg error, may cause the "
-                          "config inaccuracy, name:%V, content:%V",
-                          &name, &content);
-        }
-    }
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ev->log, 0,
-                   "[dyups] read end");
-
-    ngx_destroy_pool(pool);
-
-    return;
 }
 
 static void
