@@ -1228,37 +1228,42 @@ ngx_dyups_update_upstream(ngx_str_t *name, ngx_buf_t *buf, ngx_str_t *rv)
     }
 
     if (!dmcf->trylock) {
-
         ngx_shmtx_lock(&shpool->mutex);
-
     } else {
-
         if (!ngx_shmtx_trylock(&shpool->mutex)) {
             status = NGX_HTTP_CONFLICT;
             ngx_str_set(rv, "wait and try again\n");
-            goto finish;
+            return status;
         }
     }
 
     ngx_http_dyups_read_msg_locked(timer);
+    ngx_shmtx_unlock(&shpool->mutex);
 
     status = ngx_dyups_sandbox_update(buf, rv);
     if (status != NGX_HTTP_OK) {
-        goto finish;
+        return status;
     }
 
     status = ngx_dyups_do_update(name, buf, rv);
-    if (status == NGX_HTTP_OK) {
-
-        if (ngx_http_dyups_send_msg(name, buf, NGX_DYUPS_ADD)) {
-            ngx_str_set(rv, "alert: update success "
-                        "but not sync to other process");
-            status = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
+    if (status != NGX_HTTP_OK) {
+        return status;
     }
 
- finish:
-
+    if (!dmcf->trylock) {
+        ngx_shmtx_lock(&shpool->mutex);
+    } else {
+        if (!ngx_shmtx_trylock(&shpool->mutex)) {
+            status = NGX_HTTP_CONFLICT;
+            ngx_str_set(rv, "wait and try again\n");
+            return status;
+        }
+    }
+    if (ngx_http_dyups_send_msg(name, buf, NGX_DYUPS_ADD)) {
+        ngx_str_set(rv, "alert: update success "
+                        "but not sync to other process");
+        status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
     ngx_shmtx_unlock(&shpool->mutex);
 
     return status;
