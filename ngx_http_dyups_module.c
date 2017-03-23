@@ -130,7 +130,7 @@ static ngx_int_t ngx_http_dyups_get_shm_name(ngx_str_t *shm_name,
 static ngx_int_t ngx_http_dyups_init_process(ngx_cycle_t *cycle);
 static void ngx_http_dyups_exit_process(ngx_cycle_t *cycle);
 static void ngx_http_dyups_read_msg(ngx_event_t *ev);
-static void ngx_http_dyups_read_msg_locked(ngx_event_t *ev);
+static void ngx_http_dyups_read_msg_locked(ngx_event_t *ev, ngx_int_t unlock);
 static ngx_int_t ngx_http_dyups_send_msg(ngx_str_t *name, ngx_buf_t *body,
     ngx_uint_t flag);
 static void ngx_dyups_destroy_msg(ngx_slab_pool_t *shpool,
@@ -707,9 +707,6 @@ static ngx_int_t
 ngx_http_dyups_interface_handler(ngx_http_request_t *r)
 {
     ngx_array_t  *res;
-    ngx_event_t  *timer;
-
-    timer = &ngx_dyups_global_ctx.msg_timer;
 
     res = ngx_dyups_parse_path(r->pool, &r->uri);
     if (res == NULL) {
@@ -717,7 +714,6 @@ ngx_http_dyups_interface_handler(ngx_http_request_t *r)
     }
 
     if (r->method == NGX_HTTP_GET) {
-        ngx_http_dyups_read_msg(timer);
         return ngx_http_dyups_do_get(r, res);
     }
 
@@ -759,7 +755,7 @@ ngx_dyups_delete_upstream(ngx_str_t *name, ngx_str_t *rv)
 
     }
 
-    ngx_http_dyups_read_msg_locked(timer);
+    ngx_http_dyups_read_msg_locked(timer, 0);
 
     status = ngx_dyups_do_delete(name, rv);
     if (status != NGX_HTTP_OK) {
@@ -1236,11 +1232,11 @@ ngx_dyups_update_upstream(ngx_str_t *name, ngx_buf_t *buf, ngx_str_t *rv)
         if (!ngx_shmtx_trylock(&shpool->mutex)) {
             status = NGX_HTTP_CONFLICT;
             ngx_str_set(rv, "wait and try again\n");
-            goto finish;
+            return status;
         }
     }
 
-    ngx_http_dyups_read_msg_locked(timer);
+    ngx_http_dyups_read_msg_locked(timer, 0);
 
     status = ngx_dyups_sandbox_update(buf, rv);
     if (status != NGX_HTTP_OK) {
@@ -1994,21 +1990,29 @@ ngx_http_dyups_read_msg(ngx_event_t *ev)
                       count, s_count, d_count, dmcf->dy_upstreams.nelts);
     }
 
-    ngx_shmtx_lock(&shpool->mutex);
+    if (!ngx_shmtx_trylock(&shpool->mutex)) {
+        ngx_log_error(NGX_LOG_ERR, ev->log, 0,
+                      "[dyups] read msg trylock failed");
 
-    ngx_http_dyups_read_msg_locked(ev);
+        ngx_dyups_add_timer(ev, ngx_max(dmcf->read_msg_timeout/10, 100));
+        return;
+    }
 
-    ngx_shmtx_unlock(&shpool->mutex);
+    ngx_http_dyups_read_msg_locked(ev, 1);
+
+    // unlocked in read_msg_locked
+    //ngx_shmtx_unlock(&shpool->mutex);
 
     ngx_dyups_add_timer(ev, dmcf->read_msg_timeout);
 }
 
 
 static void
-ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
+ngx_http_dyups_read_msg_locked(ngx_event_t *ev, ngx_int_t unlock)
 {
     ngx_int_t            i, rc;
     ngx_str_t            name, content;
+    ngx_str_t            *pname, *pcontent;
     ngx_flag_t           found;
     ngx_time_t          *tp;
     ngx_pool_t          *pool;
@@ -2019,6 +2023,10 @@ ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
     ngx_dyups_msg_t     *msg;
     ngx_dyups_shctx_t   *sh;
     ngx_dyups_status_t  *status;
+    ngx_array_t *names;
+    ngx_array_t *contents;
+    ngx_array_t *flags;
+    ngx_uint_t *pflag;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ev->log, 0,
                    "[dyups] read msg %P", ngx_pid);
@@ -2048,6 +2056,9 @@ ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
     }
 
     if (ngx_queue_empty(&sh->msg_queue)) {
+        if (unlock) {
+            ngx_shmtx_unlock(&shpool->mutex);
+        }
         return;
     }
 
@@ -2056,6 +2067,10 @@ ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
         return;
     }
 
+    // 把我没有处理过的消息copy出来，然后把消息状态置为已处理
+    names = ngx_array_create(pool, 16, sizeof(ngx_str_t));
+    contents = ngx_array_create(pool, 16, sizeof(ngx_str_t));
+    flags = ngx_array_create(pool, 16, sizeof(ngx_uint_t));
     for (q = ngx_queue_last(&sh->msg_queue);
          q != ngx_queue_sentinel(&sh->msg_queue);
          q = ngx_queue_prev(q))
@@ -2100,13 +2115,29 @@ ngx_http_dyups_read_msg_locked(ngx_event_t *ev)
 
         name = msg->name;
         content = msg->content;
+        pname = ngx_array_push(names);
+        pname->len = name.len;
+        pname->data = ngx_pstrdup(pool, &name);
+        pcontent = ngx_array_push(contents);
+        pcontent->len = content.len;
+        pcontent->data = ngx_pstrdup(pool, &content);
+        pflag = ngx_array_push(flags);
+        *pflag = msg->flag;
+    }
+    if (unlock) {
+        ngx_shmtx_unlock(&shpool->mutex);
+    }
 
-        rc = ngx_dyups_sync_cmd(pool, &name, &content, msg->flag);
+    pname = names->elts;
+    pcontent = contents->elts;
+    pflag = flags->elts;
+    for (i = 0; i < (ngx_int_t)names->nelts; i++) {
+        rc = ngx_dyups_sync_cmd(pool, &pname[i], &pcontent[i], pflag[i]);
         if (rc != NGX_OK) {
             ngx_log_error(NGX_LOG_ALERT, ev->log, 0,
                           "[dyups] read msg error, may cause the "
                           "config inaccuracy, name:%V, content:%V",
-                          &name, &content);
+                          pname[i], pcontent[i]);
         }
     }
 
